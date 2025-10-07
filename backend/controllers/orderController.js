@@ -7,7 +7,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ✅ PLACE ORDER (create Stripe session + save pending order)
 const placeOrder = async (req, res) => {
-  const frontend_url = "http://localhost:5174"; // update if needed
+  const frontend_url = "https://quickbite-frontend-tj2n.onrender.com"; // update if needed
 
   try {
     // --- Verify user token or userId ---
