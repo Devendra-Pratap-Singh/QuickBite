@@ -9,7 +9,6 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const placeOrder = async (req, res) => {
   const frontend_url = "https://quickbite-frontend-tj2n.onrender.com"; // update if needed
 
-
   try {
     // --- Verify user token or userId ---
     const authHeader = req.headers.authorization || "";
