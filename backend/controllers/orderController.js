@@ -1,17 +1,22 @@
 import orderModel from "../models/orderModel.js";
-import userModel from '../models/userModel.js';
+import userModel from "../models/userModel.js";
 import Stripe from "stripe";
-import jwt from "jsonwebtoken"; 
+import jwt from "jsonwebtoken";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// ✅ PLACE ORDER (create Stripe session + save pending order)
 const placeOrder = async (req, res) => {
-  const frontend_url = "http://localhost:5174";
+  const frontend_url = "http://localhost:5174"; // update if needed
+
   try {
+    // --- Verify user token or userId ---
     const authHeader = req.headers.authorization || "";
-    const headerToken = authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : req.headers.token;
+    const headerToken = authHeader.startsWith("Bearer ")
+      ? authHeader.split(" ")[1]
+      : req.headers.token;
     let userId = req.body.userId;
-    
+
     if (!userId && headerToken) {
       try {
         const decoded = jwt.verify(headerToken, process.env.JWT_SECRET);
@@ -20,35 +25,47 @@ const placeOrder = async (req, res) => {
         console.log("Token verify failed:", err.message);
       }
     }
-    
+
     if (!userId) {
-      return res.status(400).json({ success: false, message: "Missing userId or invalid token" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing userId or invalid token" });
     }
-    
+
+    // --- Validate items ---
     const items = req.body.items;
     if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ success: false, message: "No items provided" });
+      return res
+        .status(400)
+        .json({ success: false, message: "No items provided" });
     }
-    
+
+    // --- Calculate totals ---
     const itemsTotal = items.reduce((sum, it) => {
       const price = Number(it.price) || 0;
       const qty = Number(it.quantity) || 0;
       return sum + price * qty;
     }, 0);
-    
+
     const deliveryFee = 30;
     const totalAmount = itemsTotal + deliveryFee;
-    
+
+    // --- Create pending order in DB ---
     const newOrder = new orderModel({
       userId,
       items,
       amount: totalAmount,
-      address: req.body.address
+      address: req.body.address,
+      payment: false, // initially unpaid
+      status: "pending",
     });
-    
+
     await newOrder.save();
+
+    // --- Clear user's cart ---
     await userModel.findByIdAndUpdate(userId, { cartData: {} });
-    
+
+    // --- Prepare Stripe line items ---
     const line_items = items.map((item) => ({
       price_data: {
         currency: "inr",
@@ -57,7 +74,7 @@ const placeOrder = async (req, res) => {
       },
       quantity: Number(item.quantity) || 1,
     }));
-    
+
     line_items.push({
       price_data: {
         currency: "inr",
@@ -66,92 +83,115 @@ const placeOrder = async (req, res) => {
       },
       quantity: 1,
     });
-    
+
+    // --- Create Stripe Checkout session ---
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
+      payment_method_types: ["card"],
       line_items,
       mode: "payment",
-      success_url: `${frontend_url}/verify?success=true&orderId=${newOrder._id}`,
-      cancel_url: `${frontend_url}/verify?success=false&orderId=${newOrder._id}`,
+      success_url: `${frontend_url}/verify?session_id={CHECKOUT_SESSION_ID}&orderId=${newOrder._id}`,
+      cancel_url: `${frontend_url}/verify?cancel=true&orderId=${newOrder._id}`,
     });
-    
+
     console.log("Stripe session created:", session.url);
-    return res.json({ success: true, session_url: session.url, orderId: newOrder._id });
+
+    // --- Send session info to frontend ---
+    return res.json({
+      success: true,
+      session_url: session.url,
+      orderId: newOrder._id,
+      sessionId: session.id,
+    });
   } catch (error) {
     console.error("placeOrder error:", error);
-    return res.status(500).json({ success: false, message: error.message || "Server error" });
+    return res
+      .status(500)
+      .json({ success: false, message: error.message || "Server error" });
   }
 };
 
-const verifyOrder = async(req,res) =>{
-  const {orderId,success} = req.body;
+// ✅ VERIFY ORDER (called after Stripe redirects user)
+const verifyOrder = async (req, res) => {
+  const { orderId, sessionId } = req.body;
+
   try {
-    if (success=="true") {
-      await orderModel.findByIdAndUpdate(orderId,{payment:true});
-      res.json({success:true,message:"Paid"})
+    if (!sessionId || !orderId) {
+      return res.status(400).json({ success: false, message: "Missing data" });
     }
-    else{
-      await orderModel.findByIdAndDelete(orderId);
-      res.json({success:false,message:"Not Paid"})
+
+    // --- Retrieve Stripe session details ---
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status === "paid") {
+      // ✅ Payment confirmed
+      await orderModel.findByIdAndUpdate(orderId, {
+        payment: true,
+        status: "confirmed",
+      });
+
+      return res.json({
+        success: true,
+        message: "Payment verified and order confirmed",
+      });
+    } else {
+      // ❌ Payment not completed or canceled
+      await orderModel.findByIdAndUpdate(orderId, {
+        payment: false,
+        status: "cancelled",
+      });
+
+      return res.json({
+        success: false,
+        message: "Payment not completed or cancelled",
+      });
     }
   } catch (error) {
-    console.log(error);
-    res.json({success:false,message:"Error"})
+    console.error("verifyOrder error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Error verifying payment" });
   }
-}
+};
 
-// Fixed userOrders function to work with authMiddleware
+// ✅ Get orders of a user (authMiddleware required)
 const userOrders = async (req, res) => {
   try {
-    console.log("=== userOrders Debug Info ===");
-    console.log("req.body:", req.body);
-    console.log("req.user (from middleware):", req.user);
-    
-    // Get userId from middleware (authMiddleware sets req.user.id)
     const userId = req.user?.id;
-    
-    console.log("userId from middleware:", userId);
-    console.log("userId type:", typeof userId);
-    
-    if (!userId) {
-      console.log("No userId found from middleware");
-      return res.status(400).json({ success: false, message: "User not authenticated" });
-    }
-    
-    // Find orders for the user
-    const orders = await orderModel.find({ userId });
-    console.log("Orders found:", orders.length);
-    
+    if (!userId)
+      return res
+        .status(400)
+        .json({ success: false, message: "User not authenticated" });
+
+    const orders = await orderModel.find({ userId }).sort({ createdAt: -1 });
     res.json({ success: true, data: orders });
-    
   } catch (error) {
-    console.log("=== userOrders ERROR ===");
-    console.log("Error:", error.message);
-    
+    console.error("userOrders error:", error);
     res.status(500).json({ success: false, message: "Error fetching orders" });
   }
-}
+};
 
-//Listing orders for admin panel
-const listOrders = async (req,res) =>{
+// ✅ Admin: list all orders
+const listOrders = async (req, res) => {
   try {
-    const orders = await orderModel.find({});
-    res.json({success:true,data:orders})
+    const orders = await orderModel.find({}).sort({ createdAt: -1 });
+    res.json({ success: true, data: orders });
   } catch (error) {
-    console.log(error);
-    res.json({success:false,message:"Error"})
+    console.error("listOrders error:", error);
+    res.status(500).json({ success: false, message: "Error fetching orders" });
   }
-}
+};
 
-//api for updating order status
-const updateStatus = async (req,res) => {
+// ✅ Admin: update order status
+const updateStatus = async (req, res) => {
   try {
-    await orderModel.findByIdAndUpdate(req.body.orderId,{status:req.body.status})
-    res.json({success:true,message:"Status Updated"})
+    const { orderId, status } = req.body;
+    await orderModel.findByIdAndUpdate(orderId, { status });
+    res.json({ success: true, message: "Status Updated" });
   } catch (error) {
-    console.log(error);
-    res.json({success:false,message:"Error"})    
+    console.error("updateStatus error:", error);
+    res.status(500).json({ success: false, message: "Error updating status" });
   }
-}
+};
 
 export { placeOrder, verifyOrder, userOrders, listOrders, updateStatus };
+
